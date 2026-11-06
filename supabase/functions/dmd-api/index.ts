@@ -1,4 +1,4 @@
-// Dependency-free Supabase Edge Function. Secrets come only from runtime environment.
+// Supabase Edge Function. Secrets come only from runtime environment.
 export const SERVICES = Object.freeze({
   automation: { title: 'AI-автоматизация процессов', price: '80–300 тыс. ₽', unit: 'за проект' },
   website: { title: 'Сайты и веб-разработка', price: '180–600 тыс. ₽', unit: 'за проект' },
@@ -46,7 +46,19 @@ async function readBody(req) {
   catch {throw new HttpError(400,'Некорректные данные.')}
 }
 
-export function createHandler({base,serviceKey,fetcher=fetch}) {
+let googleKeys;
+export async function verifyGoogleToken(token, audience) {
+  // Pin the verifier; keys are fetched only from Google's fixed HTTPS endpoint.
+  const {createRemoteJWKSet,jwtVerify}=await import('npm:jose@6.1.3');
+  googleKeys??=createRemoteJWKSet(new URL('https://www.googleapis.com/oauth2/v3/certs'),{timeoutDuration:5000});
+  const {payload}=await jwtVerify(token,googleKeys,{
+    audience,issuer:['https://accounts.google.com','accounts.google.com'],
+    algorithms:['RS256'],requiredClaims:['exp','iat','sub','aud','iss'],clockTolerance:30
+  });
+  return payload;
+}
+
+export function createHandler({base,serviceKey,fetcher=fetch,googleAudience='',googleSubject='',verifyIdentity=verifyGoogleToken}) {
   async function rest(path,options={}) {
     const response=await fetcher(base+'/rest/v1/'+path,{...options,headers:{apikey:serviceKey,Authorization:'Bearer '+serviceKey,'Content-Type':'application/json',...options.headers}});
     if(!response.ok)throw new HttpError(503,'База временно недоступна. Повтори попытку позже.');
@@ -78,6 +90,27 @@ export function createHandler({base,serviceKey,fetcher=fetch}) {
       if(req.method==='OPTIONS')return new Response(null,{status:204,headers:cors});
       const url=new URL(req.url),path=url.pathname.replace(/^\/functions\/v1\/dmd-api/,'').replace(/^\/dmd-api/,'');
       if(req.method==='GET'&&path==='/health')return reply(200,{ok:true});
+      if(path==='/sheets/requests'){
+        if(req.method!=='GET')throw new HttpError(405,'Метод не поддерживается.');
+        // Fail closed until the owner explicitly pairs an Apps Script project.
+        if(!googleAudience||!googleSubject)throw new HttpError(503,'Google Таблица ещё не подключена.');
+        const authorization=req.headers.get('authorization')||'';
+        if(!authorization.startsWith('Bearer ')||authorization.length>8200)throw new HttpError(401,'Требуется вход Google.');
+        let identity;
+        try {identity=await verifyIdentity(authorization.slice(7),googleAudience)}
+        catch {throw new HttpError(401,'Сессия Google не подтверждена.')}
+        if(identity.sub!==googleSubject||identity.email_verified!==true)throw new HttpError(403,'Нет доступа к заявкам DMD.');
+        // Scan immutable IDs from the beginning on every sync. This also picks up
+        // late commits; the sheet deduplicates IDs and preserves manual columns.
+        const after=url.searchParams.get('after')||'';
+        if(after&&!/^DMD-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(after))throw new HttpError(400,'Некорректная страница.');
+        const rows=await rest('dmd_requests?select=id,payload,created_at&order=id.asc&limit=101'+(after?'&id=gt.'+after:''));
+        const page=rows.slice(0,100);
+        return reply(200,{
+          items:page.map(row=>({...row.payload,id:row.id,createdAt:row.created_at})),
+          next:rows.length>100?page.at(-1).id:null
+        });
+      }
       if(req.method==='POST'&&path==='/requests'){
         const payload=validateRequest(await readBody(req)),key=req.headers.get('idempotency-key');
         if(!UUID.test(key||''))throw new HttpError(400,'Обнови страницу и повтори отправку.');
@@ -115,4 +148,7 @@ export function createHandler({base,serviceKey,fetcher=fetch}) {
     }catch(error){return reply(error instanceof HttpError?error.status:500,{error:error instanceof HttpError?error.message:'Не удалось обработать запрос. Повтори попытку позже.'})}
   };
 }
-if(typeof Deno!=='undefined')Deno.serve(createHandler({base:Deno.env.get('SUPABASE_URL'),serviceKey:Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')}));
+if(typeof Deno!=='undefined')Deno.serve(createHandler({
+  base:Deno.env.get('SUPABASE_URL'),serviceKey:Deno.env.get('SUPABASE_SERVICE_ROLE_KEY'),
+  googleAudience:Deno.env.get('DMD_GOOGLE_AUDIENCE'),googleSubject:Deno.env.get('DMD_GOOGLE_SUBJECT')
+}));
